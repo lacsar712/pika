@@ -34,6 +34,7 @@ import pika.credentials
 import pika.heartbeat
 from pika import exceptions, frame, spec, validators
 from pika._utils import override
+from pika.channel_scope import ChannelScope
 
 if TYPE_CHECKING:
     from pika import amqp_object
@@ -1093,6 +1094,9 @@ class Connection(abc.ABC):
         self._processing_frame_buffer: bool = False
         self._channels: dict[int, Channel] = {}
 
+        # Active channel-pinning scopes created via channel_scope()
+        self._channel_scopes: set[ChannelScope] = set()
+
         self._init_connection_state()
 
         # Add the on connection error callback
@@ -1142,6 +1146,10 @@ class Connection(abc.ABC):
 
         # Dict of open channels
         self._channels = {}
+
+        # Channel-pinning scopes do not survive a teardown/reconnect; their
+        # channels are meta-closed below, which fails the scopes.
+        self._channel_scopes = set()
 
         # Data used for Heartbeat checking
         self.bytes_sent = 0
@@ -1356,6 +1364,30 @@ class Connection(abc.ABC):
         return self.callbacks.remove_matching(0, self.ON_CONNECTION_ERROR,
                                               lambda cb: cb == callback)
 
+    def channel_scope(self, timeout: float | None = None) -> ChannelScope:
+        """
+        Open a channel-pinning scope on this connection.
+
+        Work inside the scope stays on the first channel successfully opened there; a second
+        channel allocation in the scope returns that same channel, and channel RPCs on any other
+        channel raise. Without an active scope, channel allocation and RPCs behave exactly as
+        without scopes.
+
+        Adapters return a scope matching their style: a synchronous context manager for
+        `BlockingConnection` and the callback adapters, an asynchronous one for
+        `AsyncioConnection`.
+
+        :param timeout: total scope budget in seconds, covering channel open and teardown;
+            None waits without a scope-level deadline
+        """
+        scope = ChannelScope(self, timeout=timeout)
+        self._channel_scopes.add(scope)
+        return scope
+
+    def _unregister_scope(self, scope: ChannelScope) -> None:
+        """Remove a completed scope from the connection's registry."""
+        self._channel_scopes.discard(scope)
+
     def channel(
             self,
             channel_number: int | None = None,
@@ -1365,6 +1397,9 @@ class Connection(abc.ABC):
         Create a new channel with the next available channel number or pass in a channel number to
         use. Must be non-zero if you would like to specify but it is recommended that you let Pika
         manage the channel numbers.
+
+        Inside an active channel-pinning scope, returns the pinned channel once the scope is bound
+        instead of allocating another one.
 
         :param channel_number: The channel number to use, defaults to the next available.
         :param on_open_callback: The callback when the channel is opened. The callback will be
@@ -1376,12 +1411,34 @@ class Connection(abc.ABC):
 
         validators.rpc_completion_callback(on_open_callback)
 
-        if not channel_number:
+        scope = ChannelScope._innermost_for(self)
+        if scope is not None:
+            scope._raise_if_failed()
+            force_bind = scope._consume_force_bind()
+            if not force_bind:
+                pinned = scope.effective_channel()
+                if pinned is not None:
+                    if channel_number and channel_number != pinned.channel_number:
+                        raise exceptions.ChannelPinViolationError(
+                            f'scope is pinned to channel {pinned.channel_number}, '
+                            f'not {channel_number}')
+                    return pinned
+                if scope._candidates:
+                    raise exceptions.ChannelPinViolationError(
+                        'a channel is already opening for the innermost '
+                        'scope; it must finish opening before another '
+                        'allocation')
+            if not channel_number:
+                channel_number = self._next_channel_number()
+            on_open_callback = scope._wrap_open_callback(on_open_callback)
+        elif not channel_number:
             channel_number = self._next_channel_number()
 
         self._channels[channel_number] = self._create_channel(
             channel_number, on_open_callback)
         self._add_channel_callbacks(channel_number)
+        if scope is not None:
+            scope._register_candidate(self._channels[channel_number])
         self._channels[channel_number].open()
         return self._channels[channel_number]
 
@@ -2423,6 +2480,7 @@ class Connection(abc.ABC):
         :param method: The method to send
         :param content: If set, is a content frame, is tuple of properties and body.
         """
+        ChannelScope._enforce_egress(self, channel_number, method)
         if content:
             self._send_message(channel_number, method, content)
         else:

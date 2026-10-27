@@ -456,3 +456,33 @@ class DuplicateGetOkCallback(ChannelError):
         return (
             f'{self.__class__.__name__}: basic_get can only be called again after the callback for '
             'the previous basic_get is executed')
+
+
+class ChannelScopeError(AMQPChannelError):
+    """Base class for errors raised by a channel-pinning scope."""
+
+
+class ChannelScopeBusyError(ChannelScopeError):
+    """The scope is already active in another task or thread, or it was re-entered before exit."""
+
+
+class ChannelScopeTimeoutError(ChannelScopeError):
+    """The scope's timeout expired while opening or tearing down its pinned channel."""
+
+
+class ChannelPinViolationError(ChannelScopeError):
+    """An RPC or channel allocation escaped the channel the scope is pinned to."""
+
+
+class ChannelScopeDirtyError(ChannelScopeError):
+    """The scope exited while consumers, transactions or publisher confirms were still open.
+
+    The pinned channel has already been closed on the failure path; the work it held was not
+    handed to another channel.
+    """
+
+    def __init__(self, *details: str) -> None:
+        """:param details: kinds of unfinished work found at exit."""
+        super().__init__('channel scope exited with unfinished work: ' +
+                         ', '.join(details))
+        self.details = tuple(details)

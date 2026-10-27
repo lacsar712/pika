@@ -7,12 +7,19 @@ import logging
 import sys
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Sequence
 
+from pika import exceptions
 from pika._utils import override
 from pika.adapters import base_connection
 from pika.adapters.utils import connection_workflow, io_services_utils, nbio_interface
+from pika.channel_scope import ChannelScope
 
 if TYPE_CHECKING:
+    from types import TracebackType
+
+    from typing_extensions import Self
+
     from pika import connection
+    from pika.channel import Channel
 
 LOGGER = logging.getLogger(__name__)
 
@@ -109,6 +116,123 @@ class AsyncioConnection(base_connection.BaseConnection):
             nbio=nbio,
             workflow=workflow,
             on_done=on_done)
+
+    @override
+    def channel_scope(self,
+                      timeout: float | None = None) -> AsyncioChannelScope:
+        """
+        Open an async channel-pinning scope.
+
+        Use with ``async with``; `AsyncioChannelScope.open_channel` awaits the pinned channel and
+        scope exit awaits its teardown.
+
+        :param timeout: total scope budget in seconds for channel open and teardown; None waits
+            without a scope-level deadline
+        """
+        return AsyncioChannelScope(self, timeout)
+
+
+class AsyncioChannelScope(ChannelScope):
+    """Channel-pinning scope for `AsyncioConnection`.
+
+    Enter with ``async with connection.channel_scope() as scope:`` and open its channel with
+    ``channel = await scope.open_channel()``. Every channel allocation and RPC inside the block
+    stays on that channel; on exit the channel is closed (failure path for consumers, a
+    transaction or unconfirmed confirms still open), bounded by the scope timeout and the
+    teardown grace. Cancellation of the block or a timeout discards the half-open or pinned
+    channel so its number cannot stay occupied.
+    """
+
+    def __init__(self, connection: AsyncioConnection,
+                 timeout: float | None) -> None:
+        """
+        :param connection: connection the scope pins a channel on
+        :param timeout: total scope budget in seconds for open and teardown
+        """
+        super().__init__(connection, timeout)
+        self._teardown_future: asyncio.Future[None] | None = None
+
+    async def __aenter__(self) -> Self:
+        self.enter()
+        return self
+
+    async def __aexit__(self, exc_type: type[BaseException] | None,
+                        exc: BaseException | None,
+                        _traceback: TracebackType | None) -> bool:
+        self.exit()
+        if not self.is_closed:
+            self._teardown_future = asyncio.get_running_loop().create_future()
+            try:
+                await asyncio.wait_for(self._teardown_future,
+                                       self._teardown_budget())
+            except asyncio.TimeoutError:
+                self.force_discard_pin()
+        self.deactivate()
+        reason = self._failed_reason
+        if exc is None and isinstance(reason, exceptions.ChannelScopeError):
+            raise reason
+        return False
+
+    # The async wrapper replaces the core scope's synchronous open with an
+    # awaitable one; the signature differs by design.
+    @override
+    async def open_channel(  # type: ignore[override]
+            self, channel_number: int | None = None) -> Channel:
+        """Open the channel pinned to this scope and await its Channel.OpenOk.
+
+        :param channel_number: optional specific channel number
+        :raises exceptions.ChannelPinViolationError: if the scope is already pinned
+        :raises exceptions.ChannelScopeTimeoutError: if the scope budget expires before OpenOk
+        """
+        loop = asyncio.get_running_loop()
+        opened: asyncio.Future[Channel] = loop.create_future()
+
+        def _on_open(channel: Channel) -> None:
+            if not opened.done():
+                opened.set_result(channel)
+
+        channel = ChannelScope.open_channel(self,
+                                            channel_number=channel_number,
+                                            on_open_callback=_on_open)
+        if channel.is_open:
+            return channel
+
+        def _on_close(_channel: Channel, reason: Exception) -> None:
+            if not opened.done():
+                opened.set_exception(reason)
+
+        channel.add_on_close_callback(_on_close)
+
+        try:
+            await asyncio.wait_for(opened, self.wait_budget())
+        except asyncio.TimeoutError:
+            self.mark_timeout()
+            self.discard_channel(channel)
+            reason = self._failed_reason
+            assert reason is not None
+            raise reason
+        except asyncio.CancelledError:
+            if self._failed_reason is None:
+                self._failed_reason = exceptions.ChannelScopeError(
+                    'channel scope was cancelled')
+            self.discard_channel(channel)
+            raise
+        return channel
+
+    @override
+    def cancel(self) -> None:
+        """Cancel the scope and schedule the pinned channel's immediate teardown."""
+        ChannelScope.cancel(self)
+
+    @override
+    def _on_teardown_complete(self, reason: Exception) -> None:
+        future = self._teardown_future
+        if future is not None and not future.done():
+            future.set_result(None)
+
+    def _teardown_budget(self) -> float:
+        remaining = self.wait_budget()
+        return self.TEARDOWN_GRACE if remaining is None else remaining
 
 
 class _AsyncioIOServicesAdapter(io_services_utils.SocketConnectionMixin,

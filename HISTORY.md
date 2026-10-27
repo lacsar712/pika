@@ -2,6 +2,10 @@
 
 Notes for each release are also published on the [GitHub releases page](https://github.com/pika/pika/releases), generated from the pull requests and issues the release contains.
 
+## Unreleased
+
+- Added `Connection.channel_scope(timeout=)`: a channel-pinning scope that keeps every channel allocation and RPC inside it on the first channel opened there. Scopes nest (an inner scope can inherit or bind its own channel), reject concurrent entry, and close their pinned channel on exit, cancellation and timeout rather than reusing it. Available as a context manager on `BlockingConnection` and the callback adapters and as `async with` on `AsyncioConnection`. Without an active scope, channel allocation and RPC behavior are unchanged.
+
 ## Upgrading to 1.5.0
 
 Six changes are worth reading before you upgrade. Three can turn a passing build red, and two change what a working application observes when it cancels a consumer or closes a channel.

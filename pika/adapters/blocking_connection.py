@@ -53,6 +53,7 @@ if TYPE_CHECKING:
 
     from typing_extensions import Self
 
+    from pika.channel_scope import ChannelScope
     from pika.spec import Basic
 
 T = TypeVar(
@@ -986,12 +987,20 @@ class BlockingConnection:
         use. Must be non-zero if you would like to specify but it is recommended that you let Pika
         manage the channel numbers.
 
+        Inside an active channel-pinning scope this returns the pinned channel's existing proxy
+        once the scope is bound, instead of allocating another channel.
+
         :param channel_number: optional channel number to use
         """
         with _CallbackResult(self._OnChannelOpenedArgs) as opened_args:
             impl_channel = self._impl.channel(
                 channel_number=channel_number,
                 on_open_callback=opened_args.set_value_once)
+
+            existing = impl_channel._get_cookie()
+            if existing is not None:
+                # Pinned by an ambient scope: the proxy was built when it opened.
+                return cast(BlockingChannel, existing)
 
             # Create our proxy channel
             channel = BlockingChannel(impl_channel, self)
@@ -1003,6 +1012,19 @@ class BlockingConnection:
             channel._flush_output(opened_args.is_ready)
 
         return channel
+
+    def channel_scope(self,
+                      timeout: float | None = None) -> BlockingChannelScope:
+        """
+        Open a channel-pinning scope with blocking open and teardown semantics.
+
+        Use as a context manager; the pinned channel is closed when the block exits, even when the
+        block raises.
+
+        :param timeout: total scope budget in seconds for channel open and teardown; None waits
+            without a scope-level deadline
+        """
+        return BlockingChannelScope(self, timeout)
 
     #
     # Connections state properties
@@ -2808,3 +2830,136 @@ class BlockingChannel:
 
             self._flush_output(rollback_ok_result.is_ready)
             return rollback_ok_result.value
+
+
+class BlockingChannelScope:
+    """Blocking channel-pinning scope returned by `BlockingConnection.channel_scope`.
+
+    Pins all channel allocations and RPCs inside the ``with`` block to the channel opened by
+    `open_channel`. The pinned channel is closed when the block exits; it is never pooled or
+    reused. Exiting with active consumers, an open transaction or unconfirmed publisher confirms
+    closes the channel on the failure path and raises
+    [`ChannelScopeDirtyError`][pika.exceptions.ChannelScopeDirtyError]; cancellation and timeout
+    raise their matching [`ChannelScopeError`][pika.exceptions.ChannelScopeError].
+
+    Example::
+
+        with connection.channel_scope(timeout=10) as scope:
+            channel = scope.open_channel()
+            channel.queue_declare(queue='example')
+            channel.basic_publish(exchange='', routing_key='example',
+                                  body=b'payload')
+    """
+
+    def __init__(self, connection: BlockingConnection,
+                 timeout: float | None) -> None:
+        """
+        :param connection: connection the scope pins a channel on
+        :param timeout: total scope budget in seconds for open and teardown
+        """
+        self._connection = connection
+        self._core: ChannelScope = connection._impl.channel_scope(
+            timeout=timeout)
+
+    def __enter__(self) -> Self:
+        self._core.enter()
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None,
+                 exc: BaseException | None,
+                 _traceback: TracebackType | None) -> None:
+        try:
+            self._teardown()
+        finally:
+            self._core.deactivate()
+        reason = self._core._failed_reason
+        if exc is None and isinstance(reason, exceptions.ChannelScopeError):
+            # Surface dirty/cancel/timeout failures that the block did not
+            # observe itself; a broker/connection closure already raised where
+            # it occurred.
+            raise reason
+
+    @property
+    def channel(self) -> BlockingChannel | None:
+        """The pinned BlockingChannel, including one inherited from an enclosing scope, or
+        None before the scope is bound.
+        """
+        impl_channel = self._core.channel
+        if impl_channel is None:
+            return None
+        proxy = impl_channel._get_cookie()
+        return cast(BlockingChannel, proxy) if proxy is not None else None
+
+    @property
+    def is_closed(self) -> bool:
+        """True once the scope and its pinned channel have been torn down."""
+        return self._core.is_closed
+
+    @property
+    def timeout(self) -> float | None:
+        """Configured total scope timeout in seconds, or None."""
+        return self._core.timeout
+
+    def open_channel(self,
+                     channel_number: int | None = None) -> BlockingChannel:
+        """Open the channel pinned to this scope and block until it is usable.
+
+        :param channel_number: optional specific channel number
+        :raises exceptions.ChannelPinViolationError: if the scope is already pinned
+        :raises exceptions.ChannelScopeTimeoutError: if the scope budget expires before OpenOk
+        """
+        with _CallbackResult(
+                self._connection._OnChannelOpenedArgs) as opened_args:
+            impl_channel = self._core.open_channel(
+                channel_number=channel_number,
+                on_open_callback=opened_args.set_value_once)
+
+            existing = impl_channel._get_cookie()
+            if existing is not None:
+                return cast(BlockingChannel, existing)
+
+            channel = BlockingChannel(impl_channel, self._connection)
+            impl_channel._set_cookie(channel)
+
+            budget = self._core.wait_budget()
+            if budget is None:
+                channel._flush_output(opened_args.is_ready)
+            else:
+                with _IoloopTimerContext(budget,
+                                         self._connection._impl) as timer:
+                    channel._flush_output(opened_args.is_ready, timer.is_ready)
+
+            if not impl_channel.is_open:
+                # No OpenOk (or closure) within the budget: release the
+                # half-open channel instead of leaving its number occupied.
+                self._core.mark_timeout()
+                self._core.discard_channel(impl_channel)
+                reason = self._core._failed_reason
+                assert reason is not None
+                raise reason
+
+        return channel
+
+    def cancel(self) -> None:
+        """Cancel the scope and tear its pinned channel down immediately."""
+        self._core.cancel()
+
+    def _teardown(self) -> None:
+        core = self._core
+        core.exit()
+        if core.is_closed:
+            return
+
+        budget = core.wait_budget()
+        if budget is None:
+            budget = core.TEARDOWN_GRACE
+        with _IoloopTimerContext(budget, self._connection._impl) as timer:
+            try:
+                self._connection._flush_output(lambda: core.is_closed,
+                                               timer.is_ready)
+            except exceptions.ConnectionClosed:
+                if not core.is_closed:
+                    raise
+
+        if not core.is_closed:
+            core.force_discard_pin()
